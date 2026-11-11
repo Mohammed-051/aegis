@@ -17,3 +17,16 @@ Commands: `/aegis status`, `/aegis on`, `/aegis off`, `/aegis pane`.
 Subagent requests, slash commands and prompts typed during a running turn are not rerouted. If the gatekeeper times out (8 s) or gives no label it can read, the prompt routes to STANDARD.
 
 Run the tests with `claude plugin test <this folder>`.
+
+## Install
+
+```bash
+/plugin marketplace add mohammed-051/aegis
+/plugin install aegis@aegis
+```
+
+Or in one step on Claude Code 2.1.275 or later:
+
+```bash
+/plugin install aegis --marketplace mohammed-051/aegis
+```
