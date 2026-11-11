@@ -1,0 +1,6 @@
+{
+  "name": "aegis",
+  "version": "0.1.0",
+  "description": "Tiered model router: Haiku gatekeeper classifies each prompt and routes the turn to Haiku, Sonnet, Opus or Fable with tuned effort, with a live pane.",
+  "types": "./types/index.d.ts"
+}

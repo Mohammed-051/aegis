@@ -1,0 +1,12 @@
+{
+  "name": "aegis",
+  "owner": { "name": "Mohammed" },
+  "description": "Aegis: tiered model router for Claude Code.",
+  "plugins": [
+    {
+      "name": "aegis",
+      "source": "./plugins/aegis",
+      "description": "Routes each prompt to Haiku, Sonnet, Opus or Fable 5.2 with per-request effort, and shows a live pane."
+    }
+  ]
+}
