@@ -4,17 +4,24 @@ export type ModelId =
   | 'claude-sonnet-5-5'
   | 'claude-opus-5-5'
   | 'claude-fable-5-2'
-export type Effort = 'low' | 'medium' | 'high'
-export type Phase = 'idle' | 'classifying' | 'active'
+export type Effort = 'low' | 'medium' | 'high' | 'xhigh'
+export type Phase = 'idle' | 'routing' | 'active'
+export type RouterChoice = 'opus' | 'fable'
+export type RouteSource = 'router' | 'sticky' | 'fallback'
 
 export type RouteState = {
   phase: Phase
   tier?: Tier
   model?: ModelId
   effort?: Effort
+  reason?: string
+  source?: RouteSource
+  routerModel?: ModelId
   demoted: boolean
-  classifierFailed: boolean
   turns: number
+  routerCalls: number
+  routerTokens: number
+  lastRouterMs?: number
 }
 
 declare module 'claude-code' {
@@ -24,6 +31,7 @@ declare module 'claude-code' {
       frame: number
       enabled: boolean
       fableExpired: boolean
+      router: RouterChoice | 'default'
     }
   }
 }

@@ -1,37 +1,57 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register, Timer } from 'claude-code'
+import type { EngineInterface, PluginOptions, Register, Timer } from 'claude-code'
 
-import type { RouteState } from '../types'
+import type { ModelId, RouterChoice, RouteState } from '../types'
 import {
-  CLASSIFIER_SYSTEM,
   FABLE_DEADLINE_UTC_MS,
-  GATEKEEPER_MODEL,
   MODEL_LABELS,
   MODEL_ORDER,
+  ROUTER_SYSTEM,
   SPINNER_FRAMES,
   TIER_TAG,
-  classifierPrompt,
   enforceDeadline,
+  fallbackRoute,
+  finalizeRoute,
+  formatTokens,
+  isContinuation,
   isFableExpired,
-  parseTier,
-  resolveRoute,
+  parseDecision,
+  routerModelFor,
+  routerPrompt,
 } from './routing'
+import type { HistoryLine, Route } from './routing'
 
 const PANE = 'aegis'
 const FRAME_MS = 110
-const CLASSIFY_TIMEOUT_MS = 8000
+const ROUTER_TIMEOUT_MS = 20_000
+const ROUTER_MAX_TOKENS = 2048
 const MAX_TIMER_MS = 2_147_483_647
 
-const IDLE: RouteState = { phase: 'idle', demoted: false, classifierFailed: false, turns: 0 }
+const IDLE: RouteState = {
+  phase: 'idle',
+  demoted: false,
+  turns: 0,
+  routerCalls: 0,
+  routerTokens: 0,
+}
 
-const route = atom({ plugin: 'aegis', key: 'route' } as const, IDLE, { shape: 'route-1' })
+const route = atom({ plugin: 'aegis', key: 'route' } as const, IDLE, { shape: 'route-2' })
 const frame = atom({ plugin: 'aegis', key: 'frame' } as const, 0)
 const enabled = atom({ plugin: 'aegis', key: 'enabled' } as const, true)
 const fableExpired = atom({ plugin: 'aegis', key: 'fableExpired' } as const, false)
+const routerOverride = atom({ plugin: 'aegis', key: 'router' } as const, 'default')
 
 const patch =
   (fields: Partial<RouteState>) =>
   (r: RouteState): RouteState => ({ ...r, ...fields })
+
+const configuredRouter = (options: PluginOptions): RouterChoice =>
+  options.router === 'fable' ? 'fable' : 'opus'
+
+const resolveRouter = async ($: EngineInterface, options: PluginOptions, now: number): Promise<ModelId> => {
+  const override = await read($, routerOverride)
+  return routerModelFor(override === 'default' ? configuredRouter(options) : override, now)
+}
 
 let spinner: Timer | undefined
 let expiryTimer: Timer | undefined
@@ -63,12 +83,54 @@ const armExpiry = async ($: EngineInterface): Promise<void> => {
   expiryTimer = $.clock.after(wait, () => void armExpiry($))
 }
 
-export const register: Register = on => {
+const recentHistory = async ($: EngineInterface): Promise<HistoryLine[]> => {
+  try {
+    const rows = await $.session.messages()
+    return rows
+      .slice(-12)
+      .map(m => ({ role: m.role, text: m.text, tools: m.toolUses.map(t => t.tool) }))
+  } catch {
+    return []
+  }
+}
+
+const routeOf = (r: RouteState): Route | undefined =>
+  r.tier && r.model && r.effort
+    ? {
+        tier: r.tier,
+        model: r.model,
+        effort: r.effort,
+        demoted: r.demoted,
+        reason: r.reason ?? '',
+        source: r.source ?? 'router',
+      }
+    : undefined
+
+const activate = async ($: EngineInterface, chosen: Route, extra: Partial<RouteState> = {}): Promise<void> => {
+  if (chosen.demoted) await update($, fableExpired, () => true)
+  await update(
+    $,
+    route,
+    patch({
+      phase: 'active',
+      tier: chosen.tier,
+      model: chosen.model,
+      effort: chosen.effort,
+      reason: chosen.reason,
+      source: chosen.source,
+      demoted: chosen.demoted,
+      ...extra,
+    }),
+  )
+  startSpinner($)
+}
+
+export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'aegis',
-      description: 'Aegis model router: on | off | status | pane',
-      argumentHint: '[on|off|status|pane]',
+      description: 'Aegis router: on | off | status | pane | router opus|fable|default',
+      argumentHint: '[on|off|status|pane|router <opus|fable|default>]',
     })
     await update($, route, patch({ phase: 'idle' }))
     await armExpiry($)
@@ -83,23 +145,34 @@ export const register: Register = on => {
   })
 
   on('command.run', { command: 'aegis' }, async ($, e) => {
-    const arg = e.args.trim().toLowerCase()
-    if (arg === 'on' || arg === 'off') {
-      await update($, enabled, () => arg === 'on')
-      return { text: `Aegis routing ${arg}.` }
+    const [verb = 'status', arg = ''] = e.args.trim().toLowerCase().split(/\s+/)
+    if (verb === 'on' || verb === 'off') {
+      await update($, enabled, () => verb === 'on')
+      return { text: `Aegis routing ${verb}.` }
     }
-    if (arg === 'pane') {
+    if (verb === 'pane') {
       await $.ui.open({ id: PANE, title: 'Aegis' })
       return { text: 'Aegis pane opened.' }
     }
+    if (verb === 'router') {
+      if (arg !== 'opus' && arg !== 'fable' && arg !== 'default') {
+        return { text: 'Usage: /aegis router opus|fable|default' }
+      }
+      await update($, routerOverride, () => arg)
+      const model = await resolveRouter($, options, await $.clock.now())
+      return { text: `Aegis router: ${MODEL_LABELS[model]}${arg === 'default' ? ' (from settings)' : ''}.` }
+    }
     const r = await read($, route)
-    const isOn = await read($, enabled)
-    const expired = await read($, fableExpired)
-    const last = r.model ? `${r.tier} -> ${MODEL_LABELS[r.model]} @ ${r.effort}` : 'none yet'
+    const now = await $.clock.now()
+    const routerModel = await resolveRouter($, options, now)
+    const last = r.model
+      ? `${r.tier} -> ${MODEL_LABELS[r.model]} @ ${r.effort} (${r.source}${r.reason ? `: ${r.reason}` : ''})`
+      : 'none yet'
     return {
       text: [
-        `Aegis: ${isOn ? 'on' : 'off'}; ${r.turns} turns routed; last route: ${last}.`,
-        `Fable 5.2: ${expired ? 'limit expired, FRONTIER routes to Opus 5.5' : `available until ${new Date(FABLE_DEADLINE_UTC_MS).toISOString()}`}.`,
+        `Aegis: ${(await read($, enabled)) ? 'on' : 'off'}; router ${MODEL_LABELS[routerModel]}; ${r.turns} turns; router spend ${formatTokens(r.routerTokens)} tokens over ${r.routerCalls} calls.`,
+        `Last route: ${last}.`,
+        `Fable 5.2: ${isFableExpired(now) ? 'limit expired; routes to Opus 5.5' : `available until ${new Date(FABLE_DEADLINE_UTC_MS).toISOString()}`}.`,
       ].join('\n'),
     }
   })
@@ -109,34 +182,44 @@ export const register: Register = on => {
       return next(e)
     }
 
-    await update($, route, patch({ phase: 'classifying' }))
-    startSpinner($)
-
     try {
-      const reply = await $.model.complete({
-        model: GATEKEEPER_MODEL,
-        system: CLASSIFIER_SYSTEM,
-        prompt: classifierPrompt(e.text),
-        maxTokens: 256,
-        effort: 'low',
-        timeoutMs: CLASSIFY_TIMEOUT_MS,
-      })
-      const parsed = reply.isAnswered ? parseTier(reply.text) : undefined
       const now = await $.clock.now()
-      const chosen = resolveRoute(parsed ?? 'STANDARD', e.text, now)
-      if (chosen.demoted) await update($, fableExpired, () => true)
-      await update(
-        $,
-        route,
-        patch({
-          phase: 'active',
-          tier: chosen.tier,
-          model: chosen.model,
-          effort: chosen.effort,
-          demoted: chosen.demoted,
-          classifierFailed: parsed === undefined,
-        }),
-      )
+      const prev = await read($, route)
+      const prior = routeOf(prev)
+
+      if (prior && isContinuation(e.text)) {
+        await activate($, finalizeRoute({ ...prior, source: 'sticky', reason: 'follow-up; kept previous route' }, now))
+      } else {
+        const routerModel = await resolveRouter($, options, now)
+        await update($, route, patch({ phase: 'routing', routerModel }))
+        startSpinner($)
+
+        const reply = await $.model.complete({
+          model: routerModel,
+          system: [{ text: ROUTER_SYSTEM, cache: true }],
+          prompt: routerPrompt({
+            text: e.text,
+            history: await recentHistory($),
+            current: prior?.model,
+            fableAvailable: !isFableExpired(now),
+          }),
+          maxTokens: ROUTER_MAX_TOKENS,
+          effort: 'low',
+          timeoutMs: ROUTER_TIMEOUT_MS,
+        })
+        const elapsed = (await $.clock.now()) - now
+        const decision = reply.isAnswered ? parseDecision(reply.text) : undefined
+        const spent = reply.usage.input_tokens + reply.usage.output_tokens + reply.usage.cache_read_input_tokens + reply.usage.cache_creation_input_tokens
+        const chosen = decision
+          ? finalizeRoute({ ...decision, source: 'router' }, now)
+          : fallbackRoute(e.text, now)
+        await activate($, chosen, {
+          routerModel,
+          lastRouterMs: elapsed,
+          routerCalls: prev.routerCalls + 1,
+          routerTokens: prev.routerTokens + spent,
+        })
+      }
     } catch {
       await goIdle($, false)
       return next(e)
@@ -150,13 +233,11 @@ export const register: Register = on => {
   on('turn.step', async function* ($, e, next) {
     if (e.agentId !== undefined) return yield* next(e)
     const r = await read($, route)
-    if (r.phase !== 'active' || !r.tier || !r.model || !r.effort) return yield* next(e)
+    const current = routeOf(r)
+    if (r.phase !== 'active' || !current) return yield* next(e)
 
-    const live = enforceDeadline(
-      { tier: r.tier, model: r.model, effort: r.effort, demoted: r.demoted },
-      await $.clock.now(),
-    )
-    if (live.model !== r.model) {
+    const live = enforceDeadline(current, await $.clock.now())
+    if (live.model !== current.model) {
       await update($, fableExpired, () => true)
       await update($, route, patch({ model: live.model, effort: live.effort, demoted: true }))
     }
@@ -175,19 +256,29 @@ export const register: Register = on => {
     const tick = await read($, frame)
     const isOn = await read($, enabled)
     const expired = await read($, fableExpired)
+    const routerModel = r.routerModel ?? (await resolveRouter($, options, await $.clock.now()))
     const glyph = SPINNER_FRAMES[tick % SPINNER_FRAMES.length]
+    const routing = r.phase === 'routing'
 
     return (
       <Box flexDirection="column" gap={1}>
         <Box flexDirection="column">
           <Text bold>Aegis router</Text>
-          <Text dimColor>{isOn ? `${r.turns} turns routed` : 'Routing off. /aegis on'}</Text>
+          <Text dimColor>
+            {isOn
+              ? `${r.turns} turns · router ${formatTokens(r.routerTokens)} tok${r.lastRouterMs !== undefined ? ` · ${(r.lastRouterMs / 1000).toFixed(1)}s` : ''}`
+              : 'Routing off. /aegis on'}
+          </Text>
         </Box>
 
         <Box flexDirection="column">
-          <Text color={r.phase === 'classifying' ? 'claude' : 'inactive'}>
-            {r.phase === 'classifying' ? glyph : '·'} Gatekeeper {r.phase === 'classifying' ? 'classifying...' : 'Haiku 5.5'}
-          </Text>
+          <Box flexDirection="row" gap={1}>
+            <Text color={routing ? 'claude' : 'inactive'}>{routing ? glyph : '◆'}</Text>
+            <Text color={routing ? 'claude' : 'text'} bold={routing}>
+              {`Router · ${MODEL_LABELS[routerModel]}`}
+            </Text>
+          </Box>
+          <Text dimColor>{routing ? '  deciding model and effort...' : r.reason ? `  ${r.reason}` : '  waiting for a prompt'}</Text>
         </Box>
 
         <Box flexDirection="column">
@@ -223,10 +314,11 @@ export const register: Register = on => {
           })}
         </Box>
 
-        {(r.demoted || r.classifierFailed) && r.phase !== 'idle' && (
+        {r.phase === 'active' && (r.demoted || r.source !== 'router') && (
           <Box flexDirection="column">
             {r.demoted && <Text color="warning">Frontier demoted to Opus 5.5</Text>}
-            {r.classifierFailed && <Text color="warning">Gatekeeper unsure; defaulted to Standard</Text>}
+            {r.source === 'sticky' && <Text dimColor>Follow-up: kept previous route, no router call</Text>}
+            {r.source === 'fallback' && <Text color="warning">Router unavailable; heuristic route</Text>}
           </Box>
         )}
       </Box>
