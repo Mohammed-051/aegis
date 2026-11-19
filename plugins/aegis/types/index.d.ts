@@ -17,7 +17,6 @@ export type RouteState = {
   reason?: string
   source?: RouteSource
   routerModel?: ModelId
-  demoted: boolean
   turns: number
   routerCalls: number
   routerTokens: number
@@ -30,7 +29,7 @@ declare module 'claude-code' {
       route: Shaped<RouteState>
       frame: number
       enabled: boolean
-      fableExpired: boolean
+      fableDownUntil: number
       router: RouterChoice | 'default'
     }
   }

@@ -2,22 +2,20 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { ModelCompleteInput, On, TurnStepInput } from 'claude-code'
 
 import {
-  FABLE_DEADLINE_UTC_MS,
+  ROUTER_SYSTEM,
   calculate_effort,
   clampEffort,
   countCodeBlocks,
-  enforceDeadline,
+  demoteFable,
   fallbackRoute,
-  finalizeRoute,
   isContinuation,
-  isFableExpired,
   parseDecision,
-  routerModelFor,
   routerPrompt,
 } from '../hooks/routing'
 
 const BEFORE = Date.UTC(2026, 10, 11, 12, 0, 0)
-const AFTER = FABLE_DEADLINE_UTC_MS + 1
+const OPUS_ROUTER = { options: { router: 'opus' } } as const
+const slash = (args: string) => ({ command: 'aegis', args, origin: { kind: 'composer' as const }, presentation: { isFullscreen: false, columns: 80 } })
 
 const PANE = {
   plugin: 'aegis',
@@ -37,7 +35,7 @@ const USAGE = { input_tokens: 900, output_tokens: 60, cache_read_input_tokens: 0
 
 type World = { steps: TurnStepInput[]; routerCalls: ModelCompleteInput[] }
 
-const engine = (on: On, reply: string | null): World => {
+const engine = (on: On, reply: string | null, throwFor: string[] = [], nullReason: 'empty-reply' | 'aborted' = 'empty-reply'): World => {
   const world: World = { steps: [], routerCalls: [] }
   on('command.register', () => ({ value: { command: 'aegis' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
@@ -48,10 +46,12 @@ const engine = (on: On, reply: string | null): World => {
   on('prompt.submit', (_, e) => ({ text: e.text }))
   on('model.complete', (_, e) => {
     world.routerCalls.push(e)
+    if (throwFor.includes(e.model))
+      return { value: { isAnswered: false, reason: 'api-error' as const, status: 429, error: 'rate_limit' as const, usage: USAGE } }
     return {
       value:
         reply === null
-          ? { isAnswered: false, reason: 'empty-reply', usage: USAGE }
+          ? { isAnswered: false, reason: nullReason, usage: USAGE }
           : { isAnswered: true, text: reply, usage: USAGE },
     }
   })
@@ -86,12 +86,6 @@ const step = (turnId: string, index = 0): TurnStepInput => ({
 const done = (turnId: string) => ({ turnId, answer: 'done', durationMs: 1, isAborted: false, reason: 'answer' as const })
 
 describe('routing core', () => {
-  test('deadline is Nov 16 2026 23:59:59.999 PST', async () => {
-    expect(new Date(FABLE_DEADLINE_UTC_MS).toISOString()).toBe('2026-11-17T07:59:59.999Z')
-    expect(isFableExpired(FABLE_DEADLINE_UTC_MS)).toBe(false)
-    expect(isFableExpired(AFTER)).toBe(true)
-  })
-
   test('effort is capped per model; Fable never above medium', async () => {
     expect(clampEffort('claude-fable-5-2', 'xhigh')).toBe('medium')
     expect(clampEffort('claude-fable-5-2', 'high')).toBe('medium')
@@ -99,21 +93,6 @@ describe('routing core', () => {
     expect(clampEffort('claude-opus-5-5', 'xhigh')).toBe('high')
     expect(clampEffort('claude-sonnet-5-5', 'xhigh')).toBe('xhigh')
     expect(clampEffort('claude-haiku-5-5', 'xhigh')).toBe('high')
-  })
-
-  test('a Fable route after the deadline becomes Opus, demoted', async () => {
-    const draft = { tier: 'FRONTIER', model: 'claude-fable-5-2', effort: 'medium', reason: '', source: 'router' } as const
-    expect(finalizeRoute(draft, BEFORE).model).toBe('claude-fable-5-2')
-    const after = finalizeRoute(draft, AFTER)
-    expect(after.model).toBe('claude-opus-5-5')
-    expect(after.demoted).toBe(true)
-    expect(enforceDeadline(finalizeRoute(draft, BEFORE), AFTER).model).toBe('claude-opus-5-5')
-  })
-
-  test('router model falls back from Fable to Opus after the deadline', async () => {
-    expect(routerModelFor('fable', BEFORE)).toBe('claude-fable-5-2')
-    expect(routerModelFor('fable', AFTER)).toBe('claude-opus-5-5')
-    expect(routerModelFor('opus', AFTER)).toBe('claude-opus-5-5')
   })
 
   test('decisions parse through prose, fences, aliases and missing fields', async () => {
@@ -142,16 +121,14 @@ describe('routing core', () => {
       text: 'add retries',
       history: [{ role: 'assistant', text: 'I updated client.ts', tools: ['Edit', 'Edit', 'Bash'] }],
       current: 'claude-sonnet-5-5',
-      fableAvailable: false,
     })
     expect(p).toContain('current_model: sonnet')
-    expect(p).toContain('fable: unavailable')
     expect(p).toContain('assistant (tools: Edit, Bash): I updated client.ts')
     expect(p).toContain('<request>\nadd retries\n</request>')
   })
 
   test('fallback is Sonnet with heuristic effort', async () => {
-    const r = fallbackRoute('x'.repeat(5000), BEFORE)
+    const r = fallbackRoute('x'.repeat(5000))
     expect(r.model).toBe('claude-sonnet-5-5')
     expect(r.effort).toBe('high')
     expect(r.source).toBe('fallback')
@@ -160,8 +137,103 @@ describe('routing core', () => {
   })
 })
 
+describe('Fable chain', () => {
+  const FABLE = 'claude-fable-5-2'
+  const OPUS = 'claude-opus-5-5'
+
+  test('ROUTER_SYSTEM covers all models and keeps security off Fable', async () => {
+    for (const m of ['haiku', 'sonnet', 'opus', 'fable']) expect(ROUTER_SYSTEM).toContain(m)
+    expect(ROUTER_SYSTEM).toContain('Never use fable for cybersecurity')
+  })
+
+  test('demoteFable maps Fable to Opus with capped effort and leaves others', async () => {
+    const d = demoteFable({ tier: 'FRONTIER', model: FABLE, effort: 'xhigh', reason: 'hard' })
+    expect([d.model, d.tier, d.effort]).toEqual([OPUS, 'COMPLEX', 'high'])
+    expect(d.reason).toContain('demoted')
+    const s = { tier: 'STANDARD', model: 'claude-sonnet-5-5', effort: 'xhigh', reason: 'x' } as const
+    expect(demoteFable(s)).toEqual(s)
+  })
+
+  test('a Fable failure retries once on Opus and uses its decision', async ($, on) => {
+    mock.clock(on, { now: BEFORE })
+    const world = engine(on, decide('sonnet', 'high', 'STANDARD'), [FABLE])
+
+    await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit(typed('Implement retry with backoff.'))
+    await drain($.turn.step(step('t1')))
+
+    expect(world.routerCalls.map(c => c.model)).toEqual([FABLE, OPUS])
+    expect(world.steps[0]?.model).toBe('claude-sonnet-5-5')
+    const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+    expect((await ui.find({ type: 'Text', text: /^Router/ }))?.text).toBe('Router · Opus 5.5')
+    await ui.unmount()
+  })
+
+  test('Fable and Opus both failing falls back to Sonnet', async ($, on) => {
+    mock.clock(on, { now: BEFORE })
+    const world = engine(on, decide('opus', 'high'), [FABLE, OPUS])
+
+    await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit(typed('fix the flaky test'))
+    await drain($.turn.step(step('t1')))
+
+    expect(world.routerCalls.map(c => c.model)).toEqual([FABLE, OPUS])
+    expect(world.steps[0]?.model).toBe('claude-sonnet-5-5')
+  })
+
+  test('an unparseable Fable reply falls back without an Opus retry', async ($, on) => {
+    mock.clock(on, { now: BEFORE })
+    const world = engine(on, 'no json')
+
+    await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit(typed('fix the flaky test'))
+    await drain($.turn.step(step('t1')))
+
+    expect(world.routerCalls.map(c => c.model)).toEqual([FABLE])
+    expect(world.steps[0]?.model).toBe('claude-sonnet-5-5')
+  })
+
+  test('an aborted Fable call falls back without retry and does not mark Fable down', async ($, on) => {
+    mock.clock(on, { now: BEFORE })
+    const world = engine(on, null, [], 'aborted')
+
+    await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit(typed('fix the flaky test'))
+    await drain($.turn.step(step('t1')))
+    await $.turn.complete(done('t1'))
+    await $.prompt.submit(typed('fix another flaky test'))
+
+    expect(world.routerCalls.map(c => c.model)).toEqual([FABLE, FABLE])
+    expect(world.steps[0]?.model).toBe('claude-sonnet-5-5')
+  })
+
+  test('while Fable is down the router starts on Opus and Fable picks demote; retried after 10 minutes', async ($, on) => {
+    const clock = mock.clock(on, { now: BEFORE })
+    const throwFor = [FABLE]
+    const world = engine(on, decide('fable', 'high', 'FRONTIER'), throwFor)
+
+    await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+    await $.prompt.submit(typed('Migrate the whole monorepo to a new build system.'))
+    await drain($.turn.step(step('t1')))
+    await $.turn.complete(done('t1'))
+    expect(world.steps[0]?.model).toBe(OPUS)
+    expect(((await $.command.run(slash('status'))) as { text: string }).text).toContain('Fable unavailable until 12:10 UTC')
+
+    await $.prompt.submit(typed('Now design the new plugin architecture.'))
+    await drain($.turn.step(step('t2')))
+    await $.turn.complete(done('t2'))
+    expect(world.routerCalls.slice(-1)[0]?.model).toBe(OPUS)
+    expect(world.steps[1]?.model).toBe(OPUS)
+
+    throwFor.length = 0
+    await clock.advance(10 * 60_000)
+    await $.prompt.submit(typed('Orchestrate agents to rewrite the compiler.'))
+    expect(world.routerCalls.slice(-1)[0]?.model).toBe(FABLE)
+  })
+})
+
 describe('session flow', () => {
-  test('Opus routes by default and its decision drives model and effort', async ($, on) => {
+  test('Fable routes by default and its decision drives model and effort', async ($, on) => {
     mock.clock(on, { now: BEFORE })
     const world = engine(on, decide('sonnet', 'xhigh', 'STANDARD', 'long agentic coding task'))
 
@@ -169,7 +241,7 @@ describe('session flow', () => {
     await $.prompt.submit(typed('Implement retry with backoff across the HTTP client and add tests.'))
     await drain($.turn.step(step('t1')))
 
-    expect(world.routerCalls[0]?.model).toBe('claude-opus-5-5')
+    expect(world.routerCalls[0]?.model).toBe('claude-fable-5-2')
     expect(world.routerCalls[0]?.effort).toBe('low')
     expect(world.routerCalls[0]?.prompt).toContain('refactor the scheduler')
     expect(world.steps[0]?.model).toBe('claude-sonnet-5-5')
@@ -178,7 +250,7 @@ describe('session flow', () => {
     for (const surface of ['terminal', 'desktop'] as const) {
       const ui = await $.ui.mount({ ...PANE, surface })
       expect((await ui.find({ type: 'Text', text: /Active/ }))?.text).toBe('  [Standard] Sonnet 5.5 Active... effort xhigh')
-      expect((await ui.find({ type: 'Text', text: /^Router/ }))?.text).toBe('Router · Opus 5.5')
+      expect((await ui.find({ type: 'Text', text: /^Router/ }))?.text).toBe('Router · Fable 5.2')
       expect((await ui.find({ type: 'Text', text: /long agentic/ }))?.text).toBe('  long agentic coding task')
       await ui.unmount()
     }
@@ -196,52 +268,25 @@ describe('session flow', () => {
     expect(world.steps[0]?.effort).toBe('medium')
   })
 
-  test('after the deadline a Fable pick runs on Opus and Fable is grayed out', async ($, on) => {
-    mock.clock(on, { now: AFTER })
-    const world = engine(on, decide('fable', 'medium', 'FRONTIER'))
-
-    await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
-    await $.prompt.submit(typed('Design a novel consensus protocol.'))
-    await drain($.turn.step(step('t1')))
-
-    expect(world.routerCalls[0]?.prompt).toContain('fable: unavailable')
-    expect(world.steps[0]?.model).toBe('claude-opus-5-5')
-    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-    expect((await ui.find({ type: 'Text', text: /Limit Expired/ }))?.text).toBe(' Limit Expired ')
-    expect((await ui.find({ type: 'Text', text: /demoted/ }))?.text).toBe('Frontier demoted to Opus 5.5')
-    await ui.unmount()
-  })
-
-  test('the deadline passing mid-turn moves Fable to Opus', async ($, on) => {
-    const clock = mock.clock(on, { now: FABLE_DEADLINE_UTC_MS - 60_000 })
-    const world = engine(on, decide('fable', 'medium'))
-
-    await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-    await $.prompt.submit(typed('Long autonomous refactor.'))
-    await drain($.turn.step(step('t1', 0)))
-    await clock.advance(120_000)
-    await drain($.turn.step(step('t1', 1)))
-
-    expect(world.steps.map(s => s.model)).toEqual(['claude-fable-5-2', 'claude-opus-5-5'])
-  })
-
-  test('the router setting picks Fable as dispatcher, and Opus after the deadline', async ($, on) => {
+  test('userConfig router=opus calls Opus', OPUS_ROUTER, async ($, on) => {
     mock.clock(on, { now: BEFORE })
-    const world = engine(on, decide('haiku', 'low'))
-
-    await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-    await $.command.run({ command: 'aegis', args: 'router fable', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
-    await $.prompt.submit(typed('what does this regex match'))
-    expect(world.routerCalls[0]?.model).toBe('claude-fable-5-2')
-  })
-
-  test('userConfig router=fable is honoured', { options: { router: 'fable' } }, async ($, on) => {
-    mock.clock(on, { now: AFTER })
     const world = engine(on, decide('haiku', 'low'))
 
     await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
     await $.prompt.submit(typed('what does this regex match'))
     expect(world.routerCalls[0]?.model).toBe('claude-opus-5-5')
+  })
+
+  test('/aegis router opus switches the router, default returns to the setting', async ($, on) => {
+    mock.clock(on, { now: BEFORE })
+    const world = engine(on, decide('haiku', 'low'))
+
+    await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+    await $.command.run(slash('router opus'))
+    await $.prompt.submit(typed('what does this regex match'))
+    await $.command.run(slash('router default'))
+    await $.prompt.submit(typed('and this other regex'))
+    expect(world.routerCalls.map(c => c.model)).toEqual(['claude-opus-5-5', 'claude-fable-5-2'])
   })
 
   test('a follow-up reuses the last route without a router call', async ($, on) => {
@@ -295,7 +340,7 @@ describe('session flow', () => {
     const world = engine(on, decide('fable', 'medium'))
 
     await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-    await $.command.run({ command: 'aegis', args: 'off', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } })
+    await $.command.run(slash('off'))
     await $.prompt.submit(typed('Design a novel consensus protocol.'))
     await drain($.turn.step(step('t1')))
 
