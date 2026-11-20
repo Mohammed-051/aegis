@@ -46,7 +46,7 @@ const patch =
   (r: RouteState): RouteState => ({ ...r, ...fields })
 
 const configuredRouter = (options: PluginOptions): RouterChoice =>
-  options.router === 'opus' ? 'opus' : 'fable'
+  options.router === 'fable' ? 'fable' : 'opus'
 
 const resolveRouter = async ($: EngineInterface, options: PluginOptions): Promise<ModelId> => {
   const override = await read($, routerOverride)

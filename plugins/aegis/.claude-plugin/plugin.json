@@ -1,6 +1,6 @@
 {
   "name": "aegis",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Opus or Fable dispatcher picks the model (Haiku, Sonnet, Opus, Fable 5.2) and effort for every prompt, with hard caps and a live pane.",
   "types": "./types/index.d.ts",
   "license": "MIT",
@@ -9,7 +9,7 @@
       "type": "string",
       "title": "Router model",
       "description": "High-cost model that decides model and effort for each prompt.",
-      "default": "fable",
+      "default": "opus",
       "options": [
         "opus",
         "fable"

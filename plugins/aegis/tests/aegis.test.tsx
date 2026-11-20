@@ -14,7 +14,7 @@ import {
 } from '../hooks/routing'
 
 const BEFORE = Date.UTC(2026, 10, 11, 12, 0, 0)
-const OPUS_ROUTER = { options: { router: 'opus' } } as const
+const FABLE_ROUTER = { options: { router: 'fable' } } as const
 const slash = (args: string) => ({ command: 'aegis', args, origin: { kind: 'composer' as const }, presentation: { isFullscreen: false, columns: 80 } })
 
 const PANE = {
@@ -154,7 +154,7 @@ describe('Fable chain', () => {
     expect(demoteFable(s)).toEqual(s)
   })
 
-  test('a Fable failure retries once on Opus and uses its decision', async ($, on) => {
+  test('a Fable failure retries once on Opus and uses its decision', FABLE_ROUTER, async ($, on) => {
     mock.clock(on, { now: BEFORE })
     const world = engine(on, decide('sonnet', 'high', 'STANDARD'), [FABLE])
 
@@ -169,7 +169,7 @@ describe('Fable chain', () => {
     await ui.unmount()
   })
 
-  test('Fable and Opus both failing falls back to Sonnet', async ($, on) => {
+  test('Fable and Opus both failing falls back to Sonnet', FABLE_ROUTER, async ($, on) => {
     mock.clock(on, { now: BEFORE })
     const world = engine(on, decide('opus', 'high'), [FABLE, OPUS])
 
@@ -181,7 +181,7 @@ describe('Fable chain', () => {
     expect(world.steps[0]?.model).toBe('claude-sonnet-5-5')
   })
 
-  test('an unparseable Fable reply falls back without an Opus retry', async ($, on) => {
+  test('an unparseable Fable reply falls back without an Opus retry', FABLE_ROUTER, async ($, on) => {
     mock.clock(on, { now: BEFORE })
     const world = engine(on, 'no json')
 
@@ -193,7 +193,7 @@ describe('Fable chain', () => {
     expect(world.steps[0]?.model).toBe('claude-sonnet-5-5')
   })
 
-  test('an aborted Fable call falls back without retry and does not mark Fable down', async ($, on) => {
+  test('an aborted Fable call falls back without retry and does not mark Fable down', FABLE_ROUTER, async ($, on) => {
     mock.clock(on, { now: BEFORE })
     const world = engine(on, null, [], 'aborted')
 
@@ -207,7 +207,7 @@ describe('Fable chain', () => {
     expect(world.steps[0]?.model).toBe('claude-sonnet-5-5')
   })
 
-  test('while Fable is down the router starts on Opus and Fable picks demote; retried after 10 minutes', async ($, on) => {
+  test('while Fable is down the router starts on Opus and Fable picks demote; retried after 10 minutes', FABLE_ROUTER, async ($, on) => {
     const clock = mock.clock(on, { now: BEFORE })
     const throwFor = [FABLE]
     const world = engine(on, decide('fable', 'high', 'FRONTIER'), throwFor)
@@ -233,7 +233,7 @@ describe('Fable chain', () => {
 })
 
 describe('session flow', () => {
-  test('Fable routes by default and its decision drives model and effort', async ($, on) => {
+  test('Opus routes by default and its decision drives model and effort', async ($, on) => {
     mock.clock(on, { now: BEFORE })
     const world = engine(on, decide('sonnet', 'xhigh', 'STANDARD', 'long agentic coding task'))
 
@@ -241,7 +241,7 @@ describe('session flow', () => {
     await $.prompt.submit(typed('Implement retry with backoff across the HTTP client and add tests.'))
     await drain($.turn.step(step('t1')))
 
-    expect(world.routerCalls[0]?.model).toBe('claude-fable-5-2')
+    expect(world.routerCalls[0]?.model).toBe('claude-opus-5-5')
     expect(world.routerCalls[0]?.effort).toBe('low')
     expect(world.routerCalls[0]?.prompt).toContain('refactor the scheduler')
     expect(world.steps[0]?.model).toBe('claude-sonnet-5-5')
@@ -250,7 +250,7 @@ describe('session flow', () => {
     for (const surface of ['terminal', 'desktop'] as const) {
       const ui = await $.ui.mount({ ...PANE, surface })
       expect((await ui.find({ type: 'Text', text: /Active/ }))?.text).toBe('  [Standard] Sonnet 5.5 Active... effort xhigh')
-      expect((await ui.find({ type: 'Text', text: /^Router/ }))?.text).toBe('Router · Fable 5.2')
+      expect((await ui.find({ type: 'Text', text: /^Router/ }))?.text).toBe('Router · Opus 5.5')
       expect((await ui.find({ type: 'Text', text: /long agentic/ }))?.text).toBe('  long agentic coding task')
       await ui.unmount()
     }
@@ -268,25 +268,25 @@ describe('session flow', () => {
     expect(world.steps[0]?.effort).toBe('medium')
   })
 
-  test('userConfig router=opus calls Opus', OPUS_ROUTER, async ($, on) => {
+  test('userConfig router=fable calls Fable', FABLE_ROUTER, async ($, on) => {
     mock.clock(on, { now: BEFORE })
     const world = engine(on, decide('haiku', 'low'))
 
     await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
     await $.prompt.submit(typed('what does this regex match'))
-    expect(world.routerCalls[0]?.model).toBe('claude-opus-5-5')
+    expect(world.routerCalls[0]?.model).toBe('claude-fable-5-2')
   })
 
-  test('/aegis router opus switches the router, default returns to the setting', async ($, on) => {
+  test('/aegis router fable switches the router, default returns to the setting', async ($, on) => {
     mock.clock(on, { now: BEFORE })
     const world = engine(on, decide('haiku', 'low'))
 
     await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
-    await $.command.run(slash('router opus'))
+    await $.command.run(slash('router fable'))
     await $.prompt.submit(typed('what does this regex match'))
     await $.command.run(slash('router default'))
     await $.prompt.submit(typed('and this other regex'))
-    expect(world.routerCalls.map(c => c.model)).toEqual(['claude-opus-5-5', 'claude-fable-5-2'])
+    expect(world.routerCalls.map(c => c.model)).toEqual(['claude-fable-5-2', 'claude-opus-5-5'])
   })
 
   test('a follow-up reuses the last route without a router call', async ($, on) => {
